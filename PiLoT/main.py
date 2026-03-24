@@ -25,9 +25,9 @@ import copy
 import logging
 import torch
 from multiprocessing import Process, Queue, Event
-from crop_test.crop_wgs84_google.crop_wgs84_google.transform_colmap import transform_colmap_pose_intrinsic
-from crop_test.crop_wgs84_google.crop_wgs84_google.proj2map import generate_ref_map
-from crop_test.crop_wgs84_google.crop_wgs84_google.utils import read_DSM_config
+from crop_wgs84_google.transform_colmap import transform_colmap_pose_intrinsic
+from crop_wgs84_google.proj2map import generate_ref_map
+from crop_wgs84_google.utils import read_DSM_config
 import torch.nn.functional as F
 import rasterio
 
