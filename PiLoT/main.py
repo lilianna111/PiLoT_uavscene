@@ -97,7 +97,8 @@ def load_poses(pose_file, origin = None):
                 render_T_w2c = Pose.from_Rt(render_T_w2c[:3, :3], render_T_w2c[:3, 3])
                 pose_dict[name]['T_w2c'] = render_T_w2c.to_flat()
     return pose_dict
-def process_map_crop(ref_DSM_path, pose_data, ref_npy_path, name, map_data_pack, paths_pack, ray_area, ray_area_minZ):
+
+def process_map_crop(ref_DSM_path, pose_data, ref_npy_path, name, map_data_pack, paths_pack, ray_area, ray_area_minZ, ray_area_f64_cached=None):
     """
     单帧处理函数：只负责计算和裁剪，不负责加载大地图
     """
@@ -107,7 +108,7 @@ def process_map_crop(ref_DSM_path, pose_data, ref_npy_path, name, map_data_pack,
     # 新 crop 的位姿和内参接口
     pose_w2c, intrinsics_dict, q_intrinsics_info, osg_dict = transform_colmap_pose_intrinsic(pose_data)
 
-    # 调新 crop，并强制保存中间结果，供后面 main 继续读
+    # 调新 crop，直接返回内存数据，避免磁盘中转
     data = generate_ref_map(
         ref_DSM_path,
         pose_data,
@@ -126,7 +127,8 @@ def process_map_crop(ref_DSM_path, pose_data, ref_npy_path, name, map_data_pack,
         ray_area_minZ,
         crop_padding=0,
         debug=False,
-        save_intermediate=True,
+        save_intermediate=False,
+        ray_area_f64_cached=ray_area_f64_cached,
     )
     return data
 
@@ -271,6 +273,7 @@ class DualProcessTask:
         logging.info(f"Loading Map from {ref_DOM_path}...")
         map_data_pack = read_DSM_config(ref_DSM_path, ref_DOM_path, ref_npy_path)
         ray_area = np.load(ref_npy_path)
+        ray_area_f64_cached = np.asarray(ray_area, dtype=np.float64)
         ray_area_minZ = np.ma.masked_values(ray_area, -9999).min()
         print("ray_area_minZ: ", ray_area_minZ)
         logging.info("Map Loaded Successfully.")
@@ -294,10 +297,8 @@ class DualProcessTask:
             pose_data = list(trans) + list(euler_crop)
             name = str(idx)
 
-            t0 = time.perf_counter()
-            tt0 = time.time()
             try:
-                _ = process_map_crop(
+                crop_data = process_map_crop(
                     ref_DSM_path,
                     pose_data, 
                     ref_npy_path, 
@@ -305,37 +306,22 @@ class DualProcessTask:
                     map_data_pack, 
                     paths_pack,
                     ray_area,
-                    ray_area_minZ
+                    ray_area_minZ,
+                    ray_area_f64_cached=ray_area_f64_cached,
                 )
             except Exception as exc:
                 logging.error(f"process_map_crop 失败 name={name}: {exc}")
                 continue
-            tt1 = time.time()
-            # print(f"process_map_crop 耗时: {tt1-tt0} 秒")
-
-            img_file = os.path.join(ref_rgb_path, f'{name}_dom.png')
-            npy_file = os.path.join(ref_depth_path, f'{name}_dsm.npy')
-            if (not os.path.exists(img_file)) or (not os.path.exists(npy_file)):
-                logging.error(f"裁剪结果缺失: {img_file} or {npy_file}")
+            if not isinstance(crop_data, dict):
+                logging.error(f"裁剪结果格式错误: name={name}")
                 continue
+            color = crop_data.get("color")
+            points3d = crop_data.get("points3d")
+            valid_mask = crop_data.get("valid_mask")
 
-            color = cv2.imread(img_file, cv2.IMREAD_COLOR)
-            if color is None:
-                logging.error(f"读取裁剪 RGB 失败: {img_file}")
+            if color is None or points3d is None or valid_mask is None:
+                logging.error(f"裁剪结果缺少必要字段: name={name}")
                 continue
-            color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)    #作用：将BGR格式转换为RGB格式
-
-            # points3d = np.load(npy_file)
-            # # valid_mask = np.isfinite(points3d).all(axis=-1) & (points3d[..., 2] > 0)    #valid_mask: 有效掩码，用于标识哪些点是有效的
-            # valid_mask = np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
-            points3d = np.load(npy_file)
-
-            mask_file = npy_file.replace("_dsm.npy", "_mask.npy")
-            if os.path.exists(mask_file):
-                valid_mask = np.load(mask_file).astype(bool)
-            else:
-                # 兜底：没有 mask 文件时才退回旧逻辑
-                valid_mask = np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
 
             # 再叠加一次数值安全检查
             valid_mask &= np.isfinite(points3d).all(axis=-1)
@@ -345,7 +331,7 @@ class DualProcessTask:
             points3d[~valid_mask] = 0.0
 
             if not np.any(valid_mask):
-                logging.error(f"裁剪结果无有效3D点: {npy_file}")
+                logging.error(f"裁剪结果无有效3D点: name={name}")
                 continue
 
             # --- 对齐参考尺寸到渲染相机分辨率（保证与 query 一致） ---
@@ -414,7 +400,6 @@ class DualProcessTask:
             pad_path = self.outputs
             padded_save_path = os.path.join(pad_path, f'{name}.png')
             cv2.imwrite(padded_save_path, cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
-            # logging.info(f"Saved padded image: {padded_save_path}")
             mask = mask.astype(bool)
 
             # 预先采样 3D 点（避免后端再随机），只保留有效点
@@ -424,7 +409,7 @@ class DualProcessTask:
             points_valid = points3d[safe_mask]
 
             if points_valid.shape[0] == 0:
-                logging.error(f"裁剪结果无有效3D点(经过padding/mask后): {npy_file}")
+                logging.error(f"裁剪结果无有效3D点(经过padding/mask后): name={name}")
                 continue
 
             sample_num = min(500, points_valid.shape[0])
@@ -442,9 +427,6 @@ class DualProcessTask:
             # 这一步在 Worker 里做，传给 Queue 
             p2d_r = torch.from_numpy(p2d_r_np).view(1, 1, -1, 2)
             visible_r = torch.from_numpy(visible_r_np).view(1, 1, -1)
-
-            tt2 = time.time()
-            # print(f"p2d_r 耗时: {tt2-tt1} 秒")
             
             # # 保存调试信息：采样点的像素位置（padding 后）与图像尺寸
             # debug_npz = os.path.join(self.outputs, f'{name}_debug_samples.npz')
@@ -457,11 +439,7 @@ class DualProcessTask:
             #     visible_r=visible_r
             # )
             # logging.info(f"Saved sampled coords: {debug_npz}, head={coords_sampled[:5].tolist()}")
-
-            t_render = (time.perf_counter() - t0) * 1e3  # ms
             fps_log_every += 1
-            # if fps_log_every % 30 == 0:
-            #     logging.info("crop: %.2f ms", t_render)
 
             try:
                 # p2d_r/visible_r 先不用于优化，改由后端重投影，避免尺度/内参错位
@@ -764,7 +742,3 @@ if __name__ == "__main__":
     dual_task.run()   
     dual_task.eval()
     
-
-
-
-

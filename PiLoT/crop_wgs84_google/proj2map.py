@@ -225,6 +225,7 @@ def crop_dsm_dom_point(
     ).astype(bool)
 
     xyz_ecef = wgs84_array_to_ecef(lon_warp, lat_warp, dsm_warp)
+
     xyz_ecef = np.nan_to_num(xyz_ecef, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     # 只保留来自原始有效 DSM 的点，其余直接清零
