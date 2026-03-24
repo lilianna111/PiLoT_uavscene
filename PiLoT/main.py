@@ -325,20 +325,54 @@ class DualProcessTask:
                 continue
             color = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)    #作用：将BGR格式转换为RGB格式
 
+            # points3d = np.load(npy_file)
+            # # valid_mask = np.isfinite(points3d).all(axis=-1) & (points3d[..., 2] > 0)    #valid_mask: 有效掩码，用于标识哪些点是有效的
+            # valid_mask = np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
             points3d = np.load(npy_file)
-            # valid_mask = np.isfinite(points3d).all(axis=-1) & (points3d[..., 2] > 0)    #valid_mask: 有效掩码，用于标识哪些点是有效的
-            valid_mask = np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
+
+            mask_file = npy_file.replace("_dsm.npy", "_mask.npy")
+            if os.path.exists(mask_file):
+                valid_mask = np.load(mask_file).astype(bool)
+            else:
+                # 兜底：没有 mask 文件时才退回旧逻辑
+                valid_mask = np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
+
+            # 再叠加一次数值安全检查
+            valid_mask &= np.isfinite(points3d).all(axis=-1)
+
+            # 无效位置强制清零，避免后续插值/复制混进去
+            points3d = points3d.astype(np.float32)
+            points3d[~valid_mask] = 0.0
+
             if not np.any(valid_mask):
                 logging.error(f"裁剪结果无有效3D点: {npy_file}")
                 continue
 
             # --- 对齐参考尺寸到渲染相机分辨率（保证与 query 一致） ---
             target_w, target_h = int(self.render_camera_osg[0]), int(self.render_camera_osg[1])
+            # color = cv2.resize(color, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            # pts_resized = []
+            # for ch in range(3):
+            #     pts_resized.append(cv2.resize(points3d[..., ch], (target_w, target_h), interpolation=cv2.INTER_LINEAR))
+            # points3d = np.stack(pts_resized, axis=-1).astype(np.float32)
             color = cv2.resize(color, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+            mask = valid_mask.astype(np.uint8)
+            mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+            # 先把无效区清零，再 resize
+            points3d_masked = points3d.copy()
+            points3d_masked[~valid_mask] = 0.0
+
             pts_resized = []
             for ch in range(3):
-                pts_resized.append(cv2.resize(points3d[..., ch], (target_w, target_h), interpolation=cv2.INTER_LINEAR))
+                pts_resized.append(
+                    cv2.resize(points3d_masked[..., ch], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                )
             points3d = np.stack(pts_resized, axis=-1).astype(np.float32)
+
+            # resize 后再次按 mask 清零
+            points3d[~mask] = 0.0
             # resize_save_path = os.path.join(self.outputs, f'{name}_1_resized.png')
             # # 注意：内存中是RGB，OpenCV保存需要BGR，否则颜色错误
             # cv2.imwrite(resize_save_path, cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
@@ -351,12 +385,32 @@ class DualProcessTask:
                 pad_h = (16 - target_h % 16) % 16
                 pad_w = (16 - target_w % 16) % 16
                 if pad_h or pad_w:
+                    # color = cv2.copyMakeBorder(color, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
+                    # mask = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
+                    # points3d_ch = []
+                    # for ch in range(3):
+                    #     points3d_ch.append(cv2.copyMakeBorder(points3d[..., ch], 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE))
+                    # points3d = np.stack(points3d_ch, axis=-1)
                     color = cv2.copyMakeBorder(color, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
-                    mask = cv2.copyMakeBorder(mask, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
+
+                    mask = cv2.copyMakeBorder(
+                        mask.astype(np.uint8),
+                        0, pad_h, 0, pad_w,
+                        cv2.BORDER_CONSTANT,
+                        value=0
+                    ).astype(bool)
+
                     points3d_ch = []
                     for ch in range(3):
-                        points3d_ch.append(cv2.copyMakeBorder(points3d[..., ch], 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE))
-                    points3d = np.stack(points3d_ch, axis=-1)
+                        points3d_ch.append(
+                            cv2.copyMakeBorder(
+                                points3d[..., ch],
+                                0, pad_h, 0, pad_w,
+                                cv2.BORDER_CONSTANT,
+                                value=0
+                            )
+                        )
+                    points3d = np.stack(points3d_ch, axis=-1).astype(np.float32)
             pad_path = self.outputs
             padded_save_path = os.path.join(pad_path, f'{name}.png')
             cv2.imwrite(padded_save_path, cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
@@ -364,15 +418,21 @@ class DualProcessTask:
             mask = mask.astype(bool)
 
             # 预先采样 3D 点（避免后端再随机），只保留有效点
-            points_valid = points3d[mask]
+            # points_valid = points3d[mask]
+            # 预先采样 3D 点（避免后端再随机），只保留有效点
+            safe_mask = mask & np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
+            points_valid = points3d[safe_mask]
+
             if points_valid.shape[0] == 0:
                 logging.error(f"裁剪结果无有效3D点(经过padding/mask后): {npy_file}")
                 continue
+
             sample_num = min(500, points_valid.shape[0])
             sel = np.random.choice(points_valid.shape[0], sample_num, replace=False)
-            points_sampled = points_valid[sel]
-            coords_all = np.argwhere(mask)  # (N,2) -> row, col on padded image
+
+            coords_all = np.argwhere(safe_mask)   # 一定要和 points_valid 对应
             coords_sampled = coords_all[sel]
+            points_sampled = points_valid[sel]
 
             p2d_r_np = np.stack([coords_sampled[:, 1], coords_sampled[:, 0]], axis=1).astype(np.float32)
             

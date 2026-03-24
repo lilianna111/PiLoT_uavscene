@@ -1296,7 +1296,7 @@ def get_3D_samples_v3(mkpts_r, depth_mat, T_c2w, camera, euler_angles, translati
             
         # [关键修改 1] 计算 Mask
         # valid = torch.isfinite(points3d).all(dim=1) & (points3d[:, 2] > 0)
-        valid_mask = np.isfinite(points3d).all(axis=-1) & (np.linalg.norm(points3d, axis=-1) > 1.0)
+        valid = torch.isfinite(points3d).all(dim=1) & (torch.norm(points3d, dim=1) > 1.0)
 
         
         # [关键修改 2] 同步过滤 3D 点

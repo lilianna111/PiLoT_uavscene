@@ -198,21 +198,55 @@ def crop_dsm_dom_point(
     dom_warp = cv2.warpPerspective(dom_hwc, H, (out_w, out_h), flags=cv2.INTER_LINEAR)
     dom_warp = np.transpose(dom_warp, (2, 0, 1))
 
-    dsm_warp = cv2.warpPerspective(dsm_crop.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
-    lon_warp = cv2.warpPerspective(lon_grid.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
-    lat_warp = cv2.warpPerspective(lat_grid.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    # dsm_warp = cv2.warpPerspective(dsm_crop.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    # lon_warp = cv2.warpPerspective(lon_grid.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+    # lat_warp = cv2.warpPerspective(lat_grid.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR)
+
+    # xyz_ecef = wgs84_array_to_ecef(lon_warp, lat_warp, dsm_warp)
+    # xyz_ecef = np.nan_to_num(xyz_ecef, nan=0.0, posinf=0.0, neginf=0.0)
+    dsm_valid_crop = valid_dsm_elevation_mask(dsm_crop).astype(np.uint8)
+
+    dsm_warp = cv2.warpPerspective(
+        dsm_crop.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR
+    )
+    lon_warp = cv2.warpPerspective(
+        lon_grid.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR
+    )
+    lat_warp = cv2.warpPerspective(
+        lat_grid.astype(np.float32), H, (out_w, out_h), flags=cv2.INTER_LINEAR
+    )
+
+    # DSM 原始有效区域同步 warp，必须用最近邻，避免插值污染 mask
+    valid_warp = cv2.warpPerspective(
+        dsm_valid_crop,
+        H,
+        (out_w, out_h),
+        flags=cv2.INTER_NEAREST
+    ).astype(bool)
 
     xyz_ecef = wgs84_array_to_ecef(lon_warp, lat_warp, dsm_warp)
-    xyz_ecef = np.nan_to_num(xyz_ecef, nan=0.0, posinf=0.0, neginf=0.0)
+    xyz_ecef = np.nan_to_num(xyz_ecef, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # 只保留来自原始有效 DSM 的点，其余直接清零
+    xyz_ecef[~valid_warp] = 0.0
 
     dsm_indices_xy = [(col, row) for row, col in dsm_indices]
+    # return (
+    #     dom_warp,
+    #     xyz_ecef,
+    #     np.array(dsm_indices_xy),
+    #     world_points_ecef,
+    #     world_points_lonlat,
+    #     min(out_w, out_h),
+    # )
     return (
-        dom_warp,
-        xyz_ecef,
-        np.array(dsm_indices_xy),
-        world_points_ecef,
-        world_points_lonlat,
-        min(out_w, out_h),
+    dom_warp,
+    xyz_ecef,
+    valid_warp,
+    np.array(dsm_indices_xy),
+    world_points_ecef,
+    world_points_lonlat,
+    min(out_w, out_h),
     )
 
 
@@ -325,7 +359,8 @@ def generate_ref_map(
     width, height = K_w2c[0, 2] * 2, K_w2c[1, 2] * 2
     image_points = [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)]
 
-    dom_crop, point_cloud_crop, dsm_indices, world_coords_ecef, world_coords_lonlat, min_shape = crop_dsm_dom_point(
+    dom_crop, point_cloud_crop, valid_mask_crop, dsm_indices, world_coords_ecef, world_coords_lonlat, min_shape = crop_dsm_dom_point(
+    # dom_crop, point_cloud_crop, dsm_indices, world_coords_ecef, world_coords_lonlat, min_shape = crop_dsm_dom_point(
         DSM_path,
         pose,
         ref_npy_path,
@@ -369,20 +404,41 @@ def generate_ref_map(
 
     point_cloud_crop = point_cloud_crop.astype(np.float32)
 
+    # if save_intermediate:
+    #     os.makedirs(ref_rgb_path, exist_ok=True)
+    #     os.makedirs(ref_depth_path, exist_ok=True)
+    #     output_img_path = os.path.join(ref_rgb_path, f'{name}_dom.png')
+    #     output_npy_path = os.path.join(ref_depth_path, f'{name}_dsm.npy')
+    #     Image.fromarray(cropped_dom_img_uint8).save(output_img_path)
+    #     np.save(output_npy_path, point_cloud_crop)
     if save_intermediate:
         os.makedirs(ref_rgb_path, exist_ok=True)
         os.makedirs(ref_depth_path, exist_ok=True)
+
         output_img_path = os.path.join(ref_rgb_path, f'{name}_dom.png')
         output_npy_path = os.path.join(ref_depth_path, f'{name}_dsm.npy')
+        output_mask_path = os.path.join(ref_depth_path, f'{name}_mask.npy')
+
         Image.fromarray(cropped_dom_img_uint8).save(output_img_path)
         np.save(output_npy_path, point_cloud_crop)
+        np.save(output_mask_path, valid_mask_crop.astype(np.uint8))
 
+    # return {
+    #     'imgr_name': name + '_dom',
+    #     'exr_name': name + '_dsm',
+    #     'min_shape': min_shape,
+    #     'world_coords_ecef': world_coords_ecef,
+    #     'world_coords_lonlat': world_coords_lonlat,
+    #     'color': cropped_dom_img_uint8,      # 新增：直接返回 HWC uint8
+    #     'points3d': point_cloud_crop,        # 新增：直接返回 HWCx3 float32
+    # }
     return {
         'imgr_name': name + '_dom',
         'exr_name': name + '_dsm',
         'min_shape': min_shape,
         'world_coords_ecef': world_coords_ecef,
         'world_coords_lonlat': world_coords_lonlat,
-        'color': cropped_dom_img_uint8,      # 新增：直接返回 HWC uint8
-        'points3d': point_cloud_crop,        # 新增：直接返回 HWCx3 float32
+        'color': cropped_dom_img_uint8,
+        'points3d': point_cloud_crop,
+        'valid_mask': valid_mask_crop.astype(bool),
     }
